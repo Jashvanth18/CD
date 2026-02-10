@@ -8,3 +8,6 @@ __pycache__/
 node_modules/
 
 Data/
+
+# Ignore unused large model
+backend/models/best_siamese_sop_only.pth
