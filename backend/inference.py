@@ -191,8 +191,9 @@ def _load_siamese():
         return
     
     # Ensure other models are unloaded first
-    if 'step_model' in globals() and step_model is not None:
-         _unload_step_model()
+    # if 'step_model' in globals() and step_model is not None:
+    #      # We keep step_model in memory now to save time
+    #      pass
          
     print("⏳ Loading SiameseDiffNet...", flush=True)
     try:
