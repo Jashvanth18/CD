@@ -4,4 +4,4 @@ numpy
 opencv-python-headless
 pillow
 torch
-torchvision
+torchvisionpython-multipart
