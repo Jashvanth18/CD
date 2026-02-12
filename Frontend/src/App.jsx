@@ -61,8 +61,24 @@ function App() {
         method: 'POST',
         body: formData,
       })
+      
+      if (!response.ok) {
+        throw new Error(`Server Error: ${response.status}`);
+      }
+
       const data = await response.json()
       
+      // Handle explicit backend error response
+      if (data.status === 'ERROR') {
+         throw new Error(data.message || 'Unknown backend error');
+      }
+
+      // Check if image data is valid
+      if (!data.image) {
+         console.warn("Backend returned no image data");
+         data.image = ""; // Prevent undefined crash
+      }
+
       // Calculate normalized score (Distance 0-100 -> Confidence 100-0)
       const rawScore = data.similarity || 0;
       const confidence = Math.max(0, Math.min(100, (100 - rawScore)));
@@ -90,7 +106,7 @@ function App() {
 
     } catch (err) {
       console.error(err)
-      alert("Failed to connect to AI Engine")
+      alert("Analysis Failed: " + err.message)
     } finally {
       setLoading(false)
     }
