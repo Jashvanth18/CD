@@ -19,8 +19,8 @@ SOP_ROOT = "data/SOP"
 # Decision thresholds
 # - Missing: Siamese classifier head probability
 # - Misalignment: SOP-vs-OBS difference compared to SOP-to-SOP baseline (per stage)
-SOP_REFS = 5
-BASELINE_REFS = 10
+SOP_REFS = 3
+BASELINE_REFS = 5
 MISSING_PROB_THRESH = 0.35
 MISALIGN_MASK_Z_THRESH = 2.5
 MISALIGN_DIFF_Z_THRESH = 2.0
@@ -80,30 +80,53 @@ tf = T.Compose([
 ])
 
 # =========================================================
-# STEP CLASSIFIER
+# STEP CLASSIFIER (Lazy Loaded)
 # =========================================================
-step_model = models.efficientnet_b0(pretrained=False)
-step_model.classifier[1] = nn.Linear(
-    step_model.classifier[1].in_features,
-    len(STAGE_NAMES)
-)
+step_model = None
 
+# Removed _unload_step_model to keep it in memory (EfficientNetB0 is small ~20MB)
 
-state_dict = torch.load(os.path.join(MODEL_DIR, "best_step_classifier.pth"),
-               map_location=DEVICE)
-# Fix mismatch where saved model has 'classifier.1.1' instead of 'classifier.1'
-new_state_dict = {}
-for k, v in state_dict.items():
-    if k.startswith("classifier.1.1."):
-        new_state_dict[k.replace("classifier.1.1.", "classifier.1.")] = v
-    else:
-        new_state_dict[k] = v
-
-step_model.load_state_dict(new_state_dict)
-
-step_model.eval().to(DEVICE)
+def _load_step_model():
+    global step_model
+    if step_model is not None:
+        return
+    
+    # Ensure big models are unloaded before loading this one
+    if 'siamese' in globals() and siamese is not None:
+         _unload_siamese()
+    
+    print("⏳ Loading Step Classifier...", flush=True)
+    try:
+        model = models.efficientnet_b0(weights=None)
+        model.classifier[1] = nn.Linear(
+            model.classifier[1].in_features,
+            len(STAGE_NAMES)
+        )
+        
+        path = os.path.join(MODEL_DIR, "best_step_classifier.pth")
+        if os.path.exists(path):
+            state_dict = torch.load(path, map_location=DEVICE)
+            # Fix mismatch where saved model has 'classifier.1.1' instead of 'classifier.1'
+            new_state_dict = {}
+            for k, v in state_dict.items():
+                if k.startswith("classifier.1.1."):
+                    new_state_dict[k.replace("classifier.1.1.", "classifier.1.")] = v
+                else:
+                    new_state_dict[k] = v
+            model.load_state_dict(new_state_dict)
+            model.eval().to(DEVICE)
+            step_model = model
+            print("✅ Step Classifier Loaded", flush=True)
+        else:
+            print(f"⚠️ Warning: {path} not found. Step classification will fail.", flush=True)
+    except Exception as e:
+        print(f"❌ Error loading Step Classifier: {e}", flush=True)
 
 def predict_stage(img_np):
+    _load_step_model()
+    if step_model is None:
+        return STAGE_NAMES[0] # Fallback
+    
     img = Image.fromarray(img_np).convert("RGB")
     x = step_tf(img).unsqueeze(0).to(DEVICE)
     with torch.no_grad():
@@ -147,11 +170,45 @@ class SiameseDiffNet(nn.Module):
         cls  = torch.sigmoid(self.classifier(diff))
         return mask, cls
 
-siamese = SiameseDiffNet().to(DEVICE)
-siamese.load_state_dict(
-    torch.load("models/best_siamese_missing.pth", map_location=DEVICE)
-)
-siamese.eval()
+siamese = None
+
+
+import gc
+
+def _unload_siamese():
+    global siamese
+    if siamese is not None:
+        del siamese
+        siamese = None
+        gc.collect()
+        if DEVICE == "cuda":
+            torch.cuda.empty_cache()
+        print("🗑️ Unloaded SiameseDiffNet", flush=True)
+
+def _load_siamese():
+    global siamese
+    if siamese is not None:
+        return
+    
+    # Ensure other models are unloaded first
+    if 'step_model' in globals() and step_model is not None:
+         _unload_step_model()
+         
+    print("⏳ Loading SiameseDiffNet...", flush=True)
+    try:
+        model = SiameseDiffNet().to(DEVICE)
+        path = "models/best_siamese_missing.pth"
+        if os.path.exists(path):
+            model.load_state_dict(
+                torch.load(path, map_location=DEVICE)
+            )
+            model.eval()
+            siamese = model
+            print("✅ SiameseDiffNet Loaded", flush=True)
+        else:
+            print(f"⚠️ Warning: {path} not found. Missing check will be limited.", flush=True)
+    except Exception as e:
+        print(f"❌ Error loading SiameseDiffNet: {e}", flush=True)
 
 # =========================================================
 # SIMPLE SIAMESE (USER PROVIDED LOGIC)
@@ -159,10 +216,20 @@ siamese.eval()
 class SimpleSiameseNetwork(nn.Module):
     def __init__(self):
         super(SimpleSiameseNetwork, self).__init__()
-        self.backbone = models.efficientnet_b0(pretrained=False)
-        self.backbone.classifier = nn.Identity()
+        # Use efficientnet_b0 as feature extractor
+        base = models.efficientnet_b0(weights=None)
+        
+        # Replicate the structure used in training:
+        # The checkpoint has keys like "feature_extractor.0..." which implies a Sequential container.
+        self.feature_extractor = nn.Sequential(
+            base.features,
+            base.avgpool,
+            nn.Flatten()
+        )
+        
+        # Combined features size: 1280 (from effnet) * 2 = 2560
         self.fc = nn.Sequential(
-            nn.Linear(1280, 512),
+            nn.Linear(2560, 512), 
             nn.ReLU(),
             nn.Dropout(0.5),
             nn.Linear(512, 1),
@@ -170,26 +237,47 @@ class SimpleSiameseNetwork(nn.Module):
         )
 
     def forward_one(self, x):
-        return self.backbone(x)
+        return self.feature_extractor(x)
 
     def forward(self, x1, x2):
         out1 = self.forward_one(x1)
         out2 = self.forward_one(x2)
-        diff = torch.abs(out1 - out2)
-        return self.fc(diff)
+        out = torch.cat((out1, out2), dim=1)
+        return self.fc(out)
 
 simple_siamese = None
-if os.path.exists("models/simple_siamese.pth"):
-    try:
-        simple_siamese = SimpleSiameseNetwork().to(DEVICE)
-        simple_siamese.load_state_dict(torch.load("models/simple_siamese.pth", map_location=DEVICE))
-        simple_siamese.eval()
-        print("✅ Loaded SimpleSiameseNetwork from models/simple_siamese.pth")
-    except Exception as e:
-        print(f"⚠️ Failed to load SimpleSiameseNetwork: {e}")
+_simple_siamese_attempted = False
+
+def _unload_simple_siamese():
+    global simple_siamese, _simple_siamese_attempted
+    if simple_siamese is not None:
+        del simple_siamese
         simple_siamese = None
-else:
-    print("ℹ️ models/simple_siamese.pth not found. Skipping simple model.")
+        _simple_siamese_attempted = False # Reset attempt flag so we try to load again next time
+        gc.collect()
+        if DEVICE == "cuda":
+            torch.cuda.empty_cache()
+        print("🗑️ Unloaded SimpleSiameseNetwork", flush=True)
+
+def _load_simple_siamese():
+    global simple_siamese, _simple_siamese_attempted
+    if simple_siamese is not None:
+        return
+        
+    _simple_siamese_attempted = True
+    if os.path.exists("models/simple_siamese.pth"):
+        try:
+            print("⏳ Loading SimpleSiameseNetwork...", flush=True)
+            model = SimpleSiameseNetwork().to(DEVICE)
+            model.load_state_dict(torch.load("models/simple_siamese.pth", map_location=DEVICE))
+            model.eval()
+            simple_siamese = model
+            print("✅ SimpleSiameseNetwork Loaded", flush=True)
+        except Exception as e:
+            print(f"⚠️ Failed to load SimpleSiameseNetwork: {e}", flush=True)
+            simple_siamese = None
+    else:
+        print("ℹ️ models/simple_siamese.pth not found. Skipping simple model.", flush=True)
 
 
 # =========================================================
@@ -282,15 +370,46 @@ def _bbox_from_binary_map(
     *,
     min_area: int = MIN_AREA,
 ) -> tuple[int, int, int, int] | None:
-    """Find a bounding box from a binary uint8 map (0/255)."""
+    """Find a bounding box from a binary uint8 map (0/255).
+       Prioritizes central contours and ignores border noise.
+    """
     cnts, _ = cv2.findContours(bin_map_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not cnts:
         return None
-    c = max(cnts, key=cv2.contourArea)
-    if cv2.contourArea(c) < min_area:
+        
+    H, W = bin_map_u8.shape
+    center_x, center_y = W // 2, H // 2
+    
+    candidates = []
+    for c in cnts:
+        area = cv2.contourArea(c)
+        if area < min_area:
+            continue
+            
+        x, y, w, h = cv2.boundingRect(c)
+        
+        # Check if touching border (noise often touches the edge)
+        margin = 2
+        touches_border = (x <= margin) or (y <= margin) or (x+w >= W-margin) or (y+h >= H-margin)
+        
+        # If it touches border, penalize it heavily (unless it's huge, >15% of image)
+        is_huge = area > (0.15 * W * H)
+        if touches_border and not is_huge:
+             continue
+
+        # Score = Area / (Distance from center + Epsilon)
+        # Closer to center = better
+        cx, cy = x + w/2, y + h/2
+        dist = np.sqrt((cx - center_x)**2 + (cy - center_y)**2)
+        score = area / (dist + 10.0) 
+        candidates.append((score, (int(x), int(y), int(w), int(h))))
+        
+    if not candidates:
         return None
-    x, y, w, h = cv2.boundingRect(c)
-    return (int(x), int(y), int(w), int(h))
+        
+    # Return best candidate
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    return candidates[0][1]
 
 
 _STAGE_BASELINE_CACHE: dict[str, tuple[float, float] | None] = {}
@@ -380,6 +499,10 @@ def get_stage_mask_baseline(stage: str) -> tuple[float, float] | None:
         _STAGE_BASELINE_CACHE[stage] = None
         return None
 
+    # Ensure siamese is loaded
+    if siamese is None:
+        _load_siamese()
+    
     # Build deterministic pairs: (0,1), (1,2), ...
     ratios: list[float] = []
     with torch.no_grad():
@@ -409,6 +532,10 @@ def get_stage_diff_baseline(stage: str) -> tuple[float, float] | None:
         _STAGE_DIFF_BASELINE_CACHE[stage] = None
         return None
 
+    # Ensure siamese is loaded
+    if siamese is None:
+        _load_siamese()
+    
     scores: list[float] = []
     with torch.no_grad():
         for i in range(len(refs) - 1):
@@ -438,6 +565,10 @@ def get_stage_cls_baseline(stage: str) -> tuple[float, float] | None:
         _STAGE_CLS_BASELINE_CACHE[stage] = None
         return None
 
+    # Ensure siamese is loaded
+    if siamese is None:
+        _load_siamese()
+    
     probs: list[float] = []
     with torch.no_grad():
         for i in range(len(refs) - 1):
@@ -461,6 +592,9 @@ def get_stage_cls_baseline(stage: str) -> tuple[float, float] | None:
 def inspect_image(obs_img):
     # ---------- Step classification ----------
     stage = predict_stage(obs_img)
+
+    # Unload step model NOT needed (keep in memory)
+    # _unload_step_model()
 
     # ---------- SOP references (deterministic) ----------
     sop_refs = load_sop_refs(stage)
@@ -512,6 +646,10 @@ def inspect_image(obs_img):
     obs_batch = obs_t.repeat(len(sop_refs), 1, 1, 1)
     sop_batch = torch.stack([tf(Image.fromarray(s)).to(DEVICE) for s in sop_refs], dim=0)   
 
+    # Ensure siamese is loaded
+    if siamese is None:
+        _load_siamese()
+    
     with torch.no_grad():
         masks, cls_probs = siamese(sop_batch, obs_batch)
         # For visualization, average masks across SOP refs
@@ -617,6 +755,9 @@ def inspect_image(obs_img):
     best_ref_idx = 0
     best_ref_img = sop_refs[0] if len(sop_refs) > 0 else np.zeros((IMG_SIZE,IMG_SIZE,3), dtype=np.uint8)
     
+    if simple_siamese is None:
+        _load_simple_siamese()
+
     if simple_siamese is not None and len(sop_refs) > 0:
         # Step 1: Find best geometric match among referees using simple pixel difference on small icons
         # This prevents comparing "Side View" to "Top View"
@@ -714,6 +855,79 @@ def inspect_image(obs_img):
     # Draw bbox only when something is wrong
     if label != "OK":
         bbox = None
+        
+    # Draw bbox only when something is wrong
+    if label != "OK":
+        bbox = None
+        
+        # 🟢 USER REQUESTED LOCALIZATION LOGIC (when Simple Model triggers)
+        # "spot the difference using bounding box like the attached image"
+        if siamese_triggered:
+             # Use the BEST ref found earlier
+             ref_224 = cv2.resize(best_ref_img, (224,224))
+             obs_224 = cv2.resize(obs_img, (224,224))
+             
+             # Convert to BGR for opencv ops if needed, but absdiff works on RGB too
+             diff = cv2.absdiff(ref_224, obs_224)
+             gray = cv2.cvtColor(diff, cv2.COLOR_RGB2GRAY)
+             
+             # User used diff_thresh=25. We keep it but add erosion to remove noise.
+             _, diff_mask = cv2.threshold(gray, 25, 255, cv2.THRESH_BINARY)
+             
+             # 1. Erode to remove thin lines (misalignment artifacts)
+             kernel_erode = np.ones((3, 3), np.uint8)
+             diff_mask = cv2.erode(diff_mask, kernel_erode, iterations=1)
+             
+             # 2. Dilate/Close to connect components of the actual missing part
+             kernel = np.ones((5, 5), np.uint8)
+             diff_mask = cv2.morphologyEx(diff_mask, cv2.MORPH_CLOSE, kernel, iterations=3)
+             diff_mask = cv2.morphologyEx(diff_mask, cv2.MORPH_OPEN, kernel, iterations=1)
+             
+             # Find contours from this mask
+             cnts_diff, _ = cv2.findContours(diff_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+             
+             valid_bbox_found = False
+             if cnts_diff:
+                # Sort by area
+                cnts_diff = sorted(cnts_diff, key=cv2.contourArea, reverse=True)
+                
+                # Iterate to find the first VALID contour (not too small, not too huge)
+                img_area = 224 * 224
+                for cnt in cnts_diff:
+                    area = cv2.contourArea(cnt)
+                    
+                    # Constraint 1: Minimum size (ignore speckles)
+                    if area < 50: 
+                        continue
+                        
+                    # Constraint 2: Maximum size (ignore global lighting changes/misalignment)
+                    # If box covers > 50% of image, it's not a "missing part", it's a different image.
+                    if area > (img_area * 0.5):
+                        print(f"[DEBUG] Ignored contour with area {area:.0f} (Too large, >50% image). Likely misalignment.")
+                        continue
+                        
+                    x, y, w, h = cv2.boundingRect(cnt)
+                    bbox = (x, y, w, h)
+                    valid_bbox_found = True
+                    print(f"[DEBUG] match found with area {area}")
+                    break
+             
+             if not valid_bbox_found:
+                 print("[DEBUG] Simple Siamese triggered but no valid localizable part found (only noise or full-image diff). Reverting to OK.")
+                 # If we can't find a specific missing part, trust the geometric alignment -> It's just noisy or misaligned.
+                 # Unless prob is SUPER high.
+                 if simple_pred < 0.90:
+                    label = "OK"
+                    color = (0,255,0)
+                    bbox = None # Ensure we don't draw
+                 else:
+                    # If 90% sure it's missing but can't localize, fallback to standard logic bbox
+                    print("[DEBUG] High confidence missing, falling back to standard localization.")
+                    bbox = None 
+
+        # Fallback to existing logic if bbox not found yet
+        if bbox is None:
+            bbox = None
 
         # ---------------------------------------------------------
         # 1. PIXEL-LEVEL DIFFERENCE LOCALIZATION (Best for "Missing")
@@ -833,18 +1047,7 @@ def inspect_image(obs_img):
         if bbox is not None:
             x, y, w, h = bbox
             cv2.rectangle(vis, (x, y), (x + w, y + h), color, 2)
-            cv2.putText(vis, label, (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2) # Added label text
-
-    # Text drawing removed as per requirement
-    # cv2.putText(
-    #     vis,
-    #     f"{stage} | {label} | D={dist:.2f}",
-    #     (10,30),
-    #     cv2.FONT_HERSHEY_SIMPLEX,
-    #     0.7,
-    #     color,
-    #     2
-    # )
+            cv2.putText(vis, label, (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
 
     return vis, stage, label, dist
 
